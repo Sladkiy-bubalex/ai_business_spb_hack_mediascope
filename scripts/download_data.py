@@ -1,4 +1,5 @@
 """Скачивает тренировочные данные с data-сервера."""
+
 import os
 import sys
 from pathlib import Path
@@ -8,7 +9,9 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-DATA_BASE_URL = os.environ.get("DATA_BASE_URL", "https://data.ai-business-spb.ru").rstrip("/")
+DATA_BASE_URL = os.environ.get(
+    "DATA_BASE_URL", "https://data.ai-business-spb.ru"
+).rstrip("/")
 API_KEY = os.environ.get("API_KEY")
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 
@@ -26,7 +29,9 @@ def download(remote_path: str) -> Path:
     dest = DATA_DIR / filename
     dest.parent.mkdir(parents=True, exist_ok=True)
     print(f"GET {url}")
-    with requests.get(url, headers={"X-API-Key": API_KEY}, stream=True, timeout=120) as r:
+    with requests.get(
+        url, headers={"X-API-Key": API_KEY}, stream=True, timeout=120
+    ) as r:
         r.raise_for_status()
         with open(dest, "wb") as f:
             for chunk in r.iter_content(chunk_size=1 << 16):

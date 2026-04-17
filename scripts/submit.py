@@ -10,13 +10,32 @@ from dotenv import load_dotenv
 load_dotenv()
 
 API_KEY = os.environ.get("API_KEY")
-APP_BASE_URL = os.environ.get("APP_BASE_URL", "https://app.ai-business-spb.ru").rstrip("/")
+APP_BASE_URL = os.environ.get("APP_BASE_URL", "https://app.ai-business-spb.ru").rstrip(
+    "/"
+)
 CASE = "mediascope"
 ROOT = Path(__file__).resolve().parent.parent
 BUNDLE = ROOT / "bundle.zip"
 
-EXCLUDE_DIRS = {"data", ".venv", ".git", "notebooks", "__pycache__", ".ipynb_checkpoints", "scripts"}
-EXCLUDE_FILES = {"bundle.zip", ".env", ".env.example", ".gitignore", ".python-version", "README.md", "pyproject.toml", "uv.lock"}
+EXCLUDE_DIRS = {
+    "data",
+    ".venv",
+    ".git",
+    "notebooks",
+    "__pycache__",
+    ".ipynb_checkpoints",
+    "scripts",
+}
+EXCLUDE_FILES = {
+    "bundle.zip",
+    ".env",
+    ".env.example",
+    ".gitignore",
+    ".python-version",
+    "README.md",
+    "pyproject.toml",
+    "uv.lock",
+}
 
 
 def build_bundle() -> Path:
