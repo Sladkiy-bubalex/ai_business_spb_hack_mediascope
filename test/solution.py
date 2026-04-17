@@ -9,7 +9,6 @@ class PredictionModel:
     batch_size: int = 1024
     
     def __init__(self) -> None:
-        os.chdir('../solution')
         self.model_dir = 'models'
         
         with open(os.path.join(self.model_dir, 'tfidf_type.pkl'), 'rb') as f:
