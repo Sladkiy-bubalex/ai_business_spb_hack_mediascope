@@ -6,7 +6,7 @@ import pandas as pd
 from dotenv import load_dotenv
 from dataclasses import dataclass
 from enum import Enum
-from marmel_grammar import MarmelGrammar
+from loguru import logger
 from typing import Optional, Tuple, Dict, Any
 
 load_dotenv()
@@ -44,43 +44,31 @@ class QueryAnalysis:
 
 
 # ============================================================================
-# ЭТАП 1: НОРМАЛИЗАЦИЯ ТЕКСТА
+# УТИЛИТЫ
 # ============================================================================
 
 
-class TextNormalizer:
+def extract_franchise(title: str) -> Optional[str]:
     """
-    Нормализация запроса: транслитерация, исправление опечаток, приведение к нормальной форме.
-    Если библиотека marmel-grammar недоступна, используется упрощенная реализация.
+    Извлечение названия франшизы из полного названия.
     """
+    if not title:
+        return None
 
-    _grammar = MarmelGrammar()
+    patterns = [
+        r'^([^:]+):',           # До двоеточия
+        r'^([^.]+)\.',           # До точки
+        r'^(.+?)\s+фильм',       # До слова "фильм"
+        r'^(.+?)\s+\d+$',        # До номера части
+        r'^(.+?)\s+—',           # До тире
+        r'^(.+?)\s+-',           # До дефиса
+    ]
 
-    @classmethod
-    def normalize(cls, query: str) -> str:
-        """Основной метод нормализации текста запроса."""
-        if not query:
-            return ""
-
-        normalized = query.strip()
-
-        # 1. Транслитерация с латиницы на кириллицу
-        normalized = cls._transliterate(normalized)
-
-        # 3. Удаление лишних пробелов
-        normalized = re.sub(r"\s+", " ", normalized)
-
-        return normalized
-
-    @classmethod
-    def _transliterate(cls, text: str) -> str:
-        """Упрощенная транслитерация. Для production лучше использовать marmel-grammar."""
-        # Проверяем, есть ли латинские символы
-        if re.search(r"[a-zA-Z]", text):
-            query = cls._grammar.transliterate_to_russian(text)
-            return query.lower()
-
-        return text.lower()
+    matches = [re.search(pattern, title.strip()) for pattern in patterns if re.search(pattern, title.strip())]
+    if matches:
+        return matches[0].group(1).strip()
+    
+    return None
 
 
 # ============================================================================
@@ -88,113 +76,180 @@ class TextNormalizer:
 # ============================================================================
 
 
-class LocalRuleEngine:
+class UnifiedQueryAnalyzer:
     """
-    Определение параметров по регулярным выражениям и словарям маркеров.
-    Позволяет избежать вызова API для очевидных случаев.
+    Единый анализатор запросов с предварительной очисткой и запроса к API Кинопоиска.
+
+    Алгоритм:
+    1. Очищаем запрос от типовых фраз ("смотреть онлайн", "скачать" и т.д.)
+    2. Ищем маркеры типа контента и запоминаем их
+    3. Удаляем найденные маркеры из запроса
+    4. Отправляем очищенный запрос в API Кинопоиска
+    5. Комбинируем результат API с найденным типом контента
     """
 
-    # Маркеры для разных типов контента
-    SERIAL_MARKERS = [
-        r"сезон\s*\d+",
-        r"серия\s*\d+",
+    # Стоп-фразы, которые нужно удалять из запроса
+    STOP_PHRASES = [
+        r"смотреть\s+онлайн(?:\s+бесплатно)?(?:\s+в\s+хорошем\s+качестве)?",
+        r"скачать(?:\s+бесплатно)?(?:\s+торрент)?(?:\s+без\s+торрента)?",
         r"все\s+серии",
-        r"сериал",
         r"все\s+сезоны",
-        r"\d+\s+сезон",
+        r"все\s+части",
+        r"\d+\s+(?:серия|серии|серию|серий)",
+        r"\d+\s+(?:сезон|сезона|сезоне|сезонов)",
+        r"(?:серия|серии|серию|серий)\s+\d+",
+        r"(?:сезон|сезона|сезоне|сезонов)\s+\d+",
+        r"\d+\s+(?:эпизод|эпизода|эпизодов)",
+        r"(?:эпизод|эпизода|эпизодов)\s+\d+",
+        r"в\s+хорошем\s+качестве",
+        r"hd\s*качество",
+        r"hd\s*rip",
+        r"бесплатно",
+        r"на\s+русском",
+        r"с\s+субтитрами",
+        r"полный\s+фильм",
+        r"полная\s+версия",
     ]
 
-    CARTOON_MARKERS = [
-        r"мультфильм",
-        r"мультик",
-        r"мульт",
-        r"анимаци",
-        r"animation",
-        r"pixar",
-        r"dreamworks",
-        r"disney",
-        r"дисней",
-        r"пиксар",
+    # Маркеры для определения типа контента (с приоритетом)
+    CONTENT_MARKERS = [
+        # Мультсериалы (наивысший приоритет)
+        (ContentType.CARTOON_SERIAL, [r"мультсериал", r"анимационный\s+сериал"]),
+        
+        # Мультфильмы
+        (ContentType.CARTOON, [
+            r"мультфильм", r"мультик", r"мульт\b", r"анимаци",
+            r"pixar", r"dreamworks", r"disney", r"дисней", r"пиксар"
+        ]),
+        
+        # Сериалы
+        (ContentType.SERIAL, [
+            r"сериал", r"сезон\s*\d+", r"серия\s*\d+", 
+            r"\d+\s+сезон", r"тв\s*сериал"
+        ]),
+        
+        # Фильмы
+        (ContentType.FILM, [
+            r"фильм", r"кино(?!поиск)", r"кинолента", r"блокбастер",
+            r"трейлер", r"премьера"
+        ]),
     ]
 
-    CARTOON_SERIAL_MARKERS = [r"мультсериал", r"анимационный\s+сериал"]
-
-    FILM_MARKERS = [r"фильм", r"кино", r"кинолента", r"блокбастер"]
-
-    @classmethod
-    def analyze(cls, query: str) -> Optional[Tuple[bool, ContentType, Optional[str]]]:
+    def __init__(self, kinopoisk_api_key: Optional[str] = None):
         """
-        Возвращает (type_query, content_type, franchise_title) или None,
-        если правила не смогли определить.
+        Инициализация анализатора.
+        
+        Args:
+            kinopoisk_api_key: API ключ для Кинопоиска. Если None, API не используется.
         """
-        query_lower = query.lower()
-
-        # 1. Определение типа контента
-        content_type = cls._detect_content_type(query_lower)
-
-        # 2. Определение, относится ли к профессиональному контенту
-        type_query = content_type != ContentType.EMPTY
-
-        # 3. Извлечение франшизы (упрощенно)
-        franchise = cls._extract_franchise(query)
-
-        if content_type != ContentType.EMPTY:
-            return (type_query, content_type, franchise)
-
-        return None
-
-    @classmethod
-    def _detect_content_type(cls, query_lower: str) -> ContentType:
-        """Определение типа контента по маркерам."""
-        # Проверяем мультсериалы (более специфичный случай)
-        for marker in cls.CARTOON_SERIAL_MARKERS:
-            if re.search(marker, query_lower):
-                return ContentType.CARTOON_SERIAL
-
-        # Проверяем сериалы
-        for marker in cls.SERIAL_MARKERS:
-            if re.search(marker, query_lower):
-                # Если есть мульт-маркеры, то это мультсериал
-                for cartoon_marker in cls.CARTOON_MARKERS:
-                    if re.search(cartoon_marker, query_lower):
-                        return ContentType.CARTOON_SERIAL
-                return ContentType.SERIAL
-
-        # Проверяем мультфильмы
-        for marker in cls.CARTOON_MARKERS:
-            if re.search(marker, query_lower):
-                return ContentType.CARTOON
-
-        # Проверяем фильмы
-        for marker in cls.FILM_MARKERS:
-            if re.search(marker, query_lower):
-                return ContentType.FILM
-
-        return ContentType.EMPTY
-
-    @classmethod
-    def _extract_franchise(cls, query: str) -> Optional[str]:
-        """
-        Извлечение названия франшизы из запроса.
-        Пример: "Гарри Поттер: Узник Аскабана" -> "Гарри Поттер"
-        """
-        # Паттерн: "Название: Подзаголовок" или "Название. Подзаголовок"
-        patterns = [
-            r"^([^:]+):",
-            r"^([^.]+)\.",
-            r"^(.+?)\s+фильм",
-            r"^(.+?)\s+\d+$",  # "Название 2" -> "Название"
+        self.kinopoisk_client = KinopoiskClient(kinopoisk_api_key) if kinopoisk_api_key else None
+        self.stop_patterns = [re.compile(p, re.IGNORECASE) for p in self.STOP_PHRASES]
+        self.marker_patterns = [
+            (ct, [re.compile(m, re.IGNORECASE) for m in markers])
+            for ct, markers in self.CONTENT_MARKERS
         ]
 
-        for pattern in patterns:
-            match = re.search(pattern, query.strip())
-            if match:
-                franchise = match.group(1).strip()
-                # Проверяем, что название достаточно длинное
-                if len(franchise) > 2:
-                    return franchise
+    def analyze(self, query: str) -> QueryAnalysis:
+        """
+        Основной метод анализа запроса.
+        
+        Args:
+            query: Исходный поисковый запрос
+            
+        Returns:
+            QueryAnalysis с результатами анализа
+        """
+        logger.debug(f"Анализ запроса: '{query}'")
+        
+        # Шаг 1: Поиск маркеров типа контента и их удаление
+        content_type, cleaned_without_markers = self._extract_and_remove_markers(query)
+        logger.debug(f"Определен тип: {content_type.value}")
+        logger.debug(f"Ключевые слова для API: '{cleaned_without_markers}'")
 
-        return None
+        # Шаг 2: Очистка запроса от стоп-фраз
+        cleaned = self._clean_query(cleaned_without_markers)
+        logger.debug(f"После очистки: '{cleaned}'")
+
+        # Шаг 3: Запрос к API Кинопоиска
+        api_result = None
+        franchise_title = None
+        
+        if self.kinopoisk_client and cleaned:
+            api_result = self.kinopoisk_client.search(cleaned)
+            
+            if api_result and api_result.get("found"):
+                logger.debug(f"Найдено в API: {api_result['title']} ({api_result['year']})")
+                
+                # Если тип контента не был определен по маркерам, определяем по API
+                if content_type == ContentType.EMPTY:
+                    content_type = self._determine_type_from_api(api_result)
+        
+        # Шаг 4: Определяем, относится ли запрос к профессиональному контенту
+        type_query = (
+            content_type != ContentType.EMPTY or 
+            (api_result and api_result.get("found", False))
+        )
+        
+        return QueryAnalysis(
+            original_query=query,
+            normalized_query=cleaned,
+            type_query=type_query,
+            content_type=content_type,
+            franchise_title=franchise_title
+        )
+
+    def _clean_query(self, query: str) -> str:
+        """
+        Очистка запроса от типовых фраз.
+        """
+        cleaned = query.strip()
+        
+        # Удаляем стоп-фразы
+        for pattern in self.stop_patterns:
+            cleaned = pattern.sub('', cleaned)
+        
+        # Удаляем лишние пробелы и знаки препинания
+        cleaned = re.sub(r'\s+', ' ', cleaned)
+        cleaned = re.sub(r'[,.!?;:]$', '', cleaned)
+        
+        return cleaned.strip()
+
+    def _extract_and_remove_markers(self, query: str) -> Tuple[ContentType, str]:
+        """
+        Извлекает тип контента по маркерам и удаляет их из запроса.
+        
+        Returns:
+            Tuple[ContentType, str]: (определенный тип, очищенный запрос)
+        """
+        content_type = ContentType.EMPTY
+        cleaned_query = query
+        
+        # Проверяем маркеры в порядке приоритета (используем прекомпилированные паттерны)
+        for ct, patterns in self.marker_patterns:
+            for pattern in patterns:
+                if pattern.search(cleaned_query):
+                    content_type = ct
+                    cleaned_query = pattern.sub('', cleaned_query)
+                    break
+            if content_type != ContentType.EMPTY:
+                break
+        
+        # Дополнительная очистка после удаления маркеров
+        cleaned_query = re.sub(r'\s+', ' ', cleaned_query).strip()
+        
+        return content_type, cleaned_query
+
+    def _determine_type_from_api(self, api_result: Dict) -> ContentType:
+        """
+        Определяет тип контента по результату API.
+        """
+        media_type = api_result.get("media_type", "")
+        is_animation = api_result.get("is_animation", False)
+        
+        if media_type == "tv":
+            return ContentType.CARTOON_SERIAL if is_animation else ContentType.SERIAL
+        else:  # movie
+            return ContentType.CARTOON if is_animation else ContentType.FILM
 
 
 # ============================================================================
@@ -214,13 +269,20 @@ class KinopoiskClient:
         self.session.headers.update(
             {"X-API-KEY": self.api_key, "Content-Type": "application/json"}
         )
+        self._search_cache: Dict[str, Dict[str, Any]] = {}
+        self._details_cache: Dict[int, Dict] = {}
 
     def search(self, query: str) -> Optional[Dict[str, Any]]:
         """
         Поиск фильма/сериала по ключевому слову.
         Возвращает нормализованные данные или None.
         """
-        print(f"   🔍 Поиск через Kinopoisk API: '{query}'")
+        logger.debug(f"Поиск через Kinopoisk API: '{query}'")
+
+        # Проверяем кэш
+        if query in self._search_cache:
+            logger.debug(f"Результат из кэша для '{query}'")
+            return self._search_cache[query]
 
         try:
             params = {"keyword": query, "page": 1}
@@ -235,14 +297,16 @@ class KinopoiskClient:
             if data.get("films") and len(data["films"]) > 0:
                 # Берем самый релевантный результат
                 best_match = data["films"][0]
-                return self._normalize_response(best_match)
+                result = self._normalize_response(best_match)
+                self._search_cache[query] = result
+                return result
             else:
-                print(f"   ⚠️ Ничего не найдено для '{query}'")
+                logger.warning(f"Ничего не найдено для '{query}'")
 
         except requests.exceptions.RequestException as e:
-            print(f"   ❌ Ошибка при обращении к Kinopoisk API: {e}")
+            logger.error(f"Ошибка при обращении к Kinopoisk API: {e}")
         except json.JSONDecodeError:
-            print(f"   ❌ Ошибка: Не удалось декодировать JSON ответ.")
+            logger.error("Не удалось декодировать JSON ответ.")
 
         return None
 
@@ -266,6 +330,8 @@ class KinopoiskClient:
         # Получаем детальную информацию для определения типа и франшизы
         details = self._get_film_details(film_id) if film_id else None
 
+        franchise = extract_franchise(title_ru) if title_ru else None
+
         if details:
             data = details.get("data")
             # Уточняем тип по детальной информации
@@ -282,11 +348,6 @@ class KinopoiskClient:
                 is_animation = any(
                     g.get("genre") == "мультфильм" for g in detail_genres
                 )
-
-            # Пытаемся определить франшизу
-            franchise = self._extract_franchise(title_ru)
-        else:
-            franchise = None
 
         # Формируем ответ
         return {
@@ -305,67 +366,20 @@ class KinopoiskClient:
 
     def _get_film_details(self, film_id: int) -> Optional[Dict]:
         """Получение детальной информации о фильме/сериале."""
+        if film_id in self._details_cache:
+            return self._details_cache[film_id]
+
         url = f"{self.base_url}/films/{film_id}"
 
         try:
             response = self.session.get(url, timeout=10)
             response.raise_for_status()
-            return response.json()
-        except Exception as e:
-            print(f"   ⚠️ Не удалось получить детали фильма {film_id}: {e}")
+            result = response.json()
+            self._details_cache[film_id] = result
+            return result
+        except requests.exceptions.RequestException as e:
+            logger.warning(f"Не удалось получить детали фильма {film_id}: {e}")
             return None
-
-    def _extract_franchise(self, title: str) -> Optional[str]:
-        """Упрощенное извлечение названия франшизы."""
-        if not title:
-            return None
-
-        # Разделяем по двоеточию или тире
-        for separator in [":", " – ", " - "]:
-            if separator in title:
-                return title.split(separator)[0].strip()
-
-        # Паттерн: "Название 2" -> "Название"
-        match = re.search(r"^(.+?)\s+\d+$", title)
-        if match:
-            return match.group(1).strip()
-
-        return None
-
-
-# ============================================================================
-# МАППИНГ В CONTENTTYPE
-# ============================================================================
-
-
-class KinopoiskMapper:
-    """Преобразование данных Kinopoisk API в ContentType."""
-
-    @classmethod
-    def map_to_analysis(
-        cls, normalized_query: str, api_result: Dict
-    ) -> "QueryAnalysis":
-        """Преобразование результата API в QueryAnalysis."""
-
-        # Определяем ContentType
-        if api_result["media_type"] == "movie":
-            if api_result.get("is_animation", False):
-                content_type = ContentType.CARTOON
-            else:
-                content_type = ContentType.FILM
-        else:  # tv
-            if api_result.get("is_animation", False):
-                content_type = ContentType.CARTOON_SERIAL
-            else:
-                content_type = ContentType.SERIAL
-
-        return QueryAnalysis(
-            original_query="",  # Будет заполнено в пайплайне
-            normalized_query=normalized_query,
-            type_query=True,  # Если нашли в Kinopoisk, то это профессиональный контент
-            content_type=content_type,
-            franchise_title=api_result.get("franchise"),
-        )
 
 
 # ============================================================================
@@ -380,48 +394,9 @@ class QueryPipeline:
     """
 
     def __init__(self, kinopoisk_api_key: str):
-        self.kinopoisk_client = KinopoiskClient(kinopoisk_api_key)
+        self.analyzer = UnifiedQueryAnalyzer(kinopoisk_api_key)
         self.local_model = None
-
-    def process(self, query: str) -> QueryAnalysis:
-        """
-        Основной метод обработки запроса.
-        Возвращает полный анализ запроса.
-        """
-        print(f"\n🔍 Обработка запроса: '{query}'")
-
-        # Шаг 1: Нормализация
-        normalized = TextNormalizer.normalize(query)
-        print(f"   📝 Нормализовано: '{normalized}'")
-
-        # Шаг 2: Локальные правила
-        rule_result = LocalRuleEngine.analyze(normalized)
-        if rule_result:
-            type_query, content_type, franchise = rule_result
-            print(
-                f"   ✅ Определено правилами: type_query={type_query}, content_type={content_type.value}"
-            )
-            return QueryAnalysis(
-                original_query=query,
-                normalized_query=normalized,
-                type_query=type_query,
-                content_type=content_type,
-                franchise_title=franchise,
-            )
-
-        # Шаг 3: Запрос к Kinopoisk API
-        api_result = self.kinopoisk_client.search(normalized)
-        if api_result:
-            print(
-                f"   ✅ Найдено в Kinopoisk: {api_result['title']} ({api_result['media_type']})"
-            )
-            analysis = KinopoiskMapper.map_to_analysis(normalized, api_result)
-            analysis.original_query = query
-            return analysis
-
-        # Шаг 4: Fallback на модель
-        return self._fallback_to_model(query, normalized)
-
+    
     def _fallback_to_model(
         self, original_query: str, normalized_query: str
     ) -> QueryAnalysis:
@@ -440,6 +415,34 @@ class QueryPipeline:
             content_type=ContentType.EMPTY,
             franchise_title=None,
         )
+
+    def _normalize_text(self, text: str) -> str:
+        """Нормализация текста (сохраняет двоеточия и тире для извлечения франшиз)"""
+        text = text.lower()
+        text = text.replace("ё", "е")
+        text = re.sub(r"\r\n|\n", " ", text)
+        text = re.sub(r"[^\w\s:–\-]", " ", text)
+        text = re.sub(r"\s+", " ", text)
+        return text.strip()
+
+    def process(self, query: str) -> QueryAnalysis:
+        """
+        Основной метод обработки запроса.
+        Возвращает полный анализ запроса.
+        """
+        logger.info(f"🔍 Обработка запроса: '{query}'")
+
+        # Шаг 1: Нормализация
+        normalized = self._normalize_text(query)
+        logger.info(f"📝 Нормализовано: '{normalized}'")
+
+        # Шаг 2: Локальные правила
+        rule_result = self.analyzer.analyze(normalized)
+        if rule_result.type_query:
+            return rule_result
+
+        # Шаг 3: Fallback на модель
+        return self._fallback_to_model(query, normalized)
 
     def set_local_model(self, model):
         """Установка модели для fallback-обработки."""
@@ -464,7 +467,7 @@ def test_pipeline():
 
     for _, row in df.iterrows():
         result = pipeline.process(row["QueryText"])
-        print(f"\n📊 Результат для '{row["QueryText"]}':")
+        print(f"\n📊 Результат для '{row['QueryText']}':")
         print(f"   {json.dumps(result.to_dict(), ensure_ascii=False, indent=2)}")
         print("-" * 50)
 

@@ -2,15 +2,15 @@
 name = "mediascope-starter"
 version = "0.1.0"
 description = "Mediascope case starter — AI Business SPB Hackathon 2026"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<4.0"
 dependencies = [
     "pandas>=2.0",
     "numpy>=1.24",
     "scikit-learn>=1.3",
     "requests>=2.31",
     "python-dotenv>=1.0",
-    "marmel-grammar (>=0.1.9,<0.2.0)",
     "black (>=26.3.1,<27.0.0)",
+    "loguru (>=0.7.3,<0.8.0)",
 ]
 
 [tool.uv]
