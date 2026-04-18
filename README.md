@@ -1,7 +1,12 @@
-## learn.ipynb - обучение и сохранение файлов
-## solution.py - файл для отправки
-## models - модели для solution.py
+### solution.py - файл для предсказаний
+### models - модели для solution.py
+### mediahack.zip - submission для отправки
 
-## test/
-## unzip.py - распаковывает zip в папку test
-## inference.py - проверка работы инференса, он не работает т.к в solution.py -> os.chdir('../solution'), просто закоментируйте эту строку потом при сабмите уберите тип комментарий
+### Обучение, предсказание и оценка на train датасете: [Notebook train](https://www.kaggle.com/code/antonoof/simpler-ensemble-mediahack/notebook?scriptVersionId=312592786)
+
+### Интересное переобучение, делать title-NaN для повышения скора(мы так не делали, просто наблюдение) [Notebook 0.91+ score](https://www.kaggle.com/code/antonoof/cheating-titles-nan?scriptVersionId=312589510)
+
+### Дальнейшие улучшения:
+1. База знаний.
+2. Использование RAG или агент архитектур.
+3. Голосование по результатам.
