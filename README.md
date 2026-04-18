@@ -1,151 +1,143 @@
-# Mediascope — AI Business SPB Hackathon 2026
+# Решение команды ДКАРТ — AI Business SPB Hack 2026
 
-Классифицируйте поисковые запросы по трём атрибутам:
+**Трек:** Mediascope — классификация поисковых запросов
 
-- **TypeQuery** (бинарный) — относится ли запрос к профессиональному видеоконтенту
-- **ContentType** — `фильм`, `сериал`, `мультфильм`, `мультсериал`, `прочее` или пусто
-- **Title** — нормализованное название франшизы или пусто
+---
 
-Тренировочные данные содержат пользовательские запросы с опечатками, транслитерацией и обобщёнными формулировками. Тестовые данные командам недоступны — вы отправляете код, который запускается в серверной песочнице.
+## Задача
 
-**Платформа:** https://app.ai-business-spb.ru
+По поисковому запросу пользователя определить три поля:
 
-## Метрика
+| Поле | Описание | Значения |
+|------|----------|---------|
+| **TypeQuery** | Ищет ли пользователь видеоконтент | `0` / `1` |
+| **ContentType** | Тип контента | `фильм` / `сериал` / `мультфильм` / `мультсериал` / `прочее` / _пусто_ |
+| **Title** | Название тайтла (название франшизы) | строка |
+
+**Метрика:** `0.35 × TypeQuery_F2 + 0.30 × ContentType_macroF1 + 0.35 × Title_tokenF1`
+
+**Результат на тестовой выборке:** `0.7206`
+
+---
+
+## Зависимости
+
+**Python:** 3.9+
 
 ```
-typequery_f2         = F_beta(y_true, y_pred, beta=2)                   # по всем строкам
-contenttype_macro_f1 = macro F1 по 6 классам                            # только GT TypeQuery=1
-title_token_f1       = среднее token-level F1 на bag-of-words           # только GT TypeQuery=1
-combined_score       = 0.35 * typequery_f2 + 0.30 * contenttype_macro_f1 + 0.35 * title_token_f1
+pandas>=2.0
+numpy>=1.24
+scikit-learn>=1.3
+joblib>=1.3
+rapidfuzz>=3.0
+openai>=1.0
 ```
 
-`combined_score` — ключ лидерборда.
-
-## Быстрый старт
+Установка:
 
 ```bash
-uv sync
-cp .env.example .env
-# впишите API_KEY из личного кабинета на app.ai-business-spb.ru
+pip install pandas numpy scikit-learn joblib rapidfuzz openai
 ```
 
-## Загрузка данных
+---
 
-### Через скрипт
+## Структура архива
 
-```bash
-uv run scripts/download_data.py
+```
+mediahack-8/
+├── solution.py          # Основной файл — классы TextEnsemble и PredictionModel
+├── llm_config.json      # Конфигурация API Yandex AI Studio
+├── README.md            # Этот файл
+└── models/
+    ├── ens_type.pkl      # Обученный ансамбль для предсказания TypeQuery
+    ├── ens_content.pkl   # Обученный ансамбль для предсказания ContentType
+    ├── le_content.pkl    # LabelEncoder для классов ContentType
+    ├── noise_words.pkl   # Список стоп-слов для извлечения тайтла
+    └── titles_dict.json  # Словарь тайтлов (~35 000 записей из KinoPoisk + train)
 ```
 
-### Вручную через API
+---
 
-```bash
-curl -H "X-API-Key: YOUR_API_KEY" \
-     https://data.ai-business-spb.ru/data/mediascope/train.csv \
-     -o data/train.csv
-```
-
-Или через Python:
+## Как запустить
 
 ```python
-import requests
-
-headers = {"X-API-Key": "YOUR_API_KEY"}
-r = requests.get("https://data.ai-business-spb.ru/data/mediascope/train.csv", headers=headers)
-with open("data/train.csv", "wb") as f:
-    f.write(r.content)
-```
-
-## Формат данных
-
-`train.csv` содержит столбцы: `QueryText`, `TypeQuery`, `Title`, `ContentType`.
-
-## Интерфейс решения
-
-В корне архива должен быть `solution.py` с классом `PredictionModel`:
-
-```python
-class PredictionModel:
-    batch_size: int = 10  # опционально, по умолчанию 10
-
-    def __init__(self) -> None:
-        # вызывается один раз при старте
-        ...
-
-    def predict(self, df: pd.DataFrame) -> pd.DataFrame:
-        # df — батч из batch_size строк (последний может быть меньше)
-        # df содержит столбец QueryText
-        # вернуть DataFrame со столбцами: QueryText, TypeQuery (int 0/1), Title (str), ContentType (str)
-        ...
-```
-
-Песочница вызывает `predict()` порциями по `batch_size` строк. Если вам нужна параллельная обработка (например, конкурентные запросы к LLM API) — реализуйте её внутри `predict()`.
-
-## Запуск бейзлайна локально
-
-```bash
-uv run python -c "
-import pandas as pd
 from solution import PredictionModel
-df = pd.read_csv('data/train.csv').head(20)
-model = PredictionModel()
-print(model.predict(df[['QueryText']]))
-"
+import pandas as pd
+
+# Инициализация — загружает модели, словарь и LLM-клиент
+model = PredictionModel("models")
+
+# Входные данные — DataFrame с колонкой QueryText
+df = pd.DataFrame({
+    "QueryText": [
+        "гарри поттер смотреть онлайн",
+        "погода в москве",
+        "наруто 5 сезон все серии",
+        "garri potter smotret online",
+    ]
+})
+
+# Предсказание
+result = model.predict(df)
+print(result)
+# Колонки: QueryText, TypeQuery, Title, ContentType
 ```
 
-Базовое решение в `solution.py` предсказывает `TypeQuery=0`, `Title=""`, `ContentType="other"` для всех строк — тривиальный старт.
+---
 
-## Отправка решения
+## Внутренние составляющие
 
-### Через веб-интерфейс
+### 1. TextEnsemble (ML-ансамбль)
 
-Зайдите на https://app.ai-business-spb.ru, перейдите в раздел «Отправка» и загрузите архив.
+Три TF-IDF модели с разными конфигурациями, усреднение вероятностей:
 
-### Через скрипт
+| № | Векторизация | Классификатор |
+|---|-------------|---------------|
+| 1 | word n-gram (1,2), max 50 000 фич | LogisticRegression, C=1.5, balanced |
+| 2 | word n-gram (2,4), max 30 000 фич | SGDClassifier, log_loss, balanced |
+| 3 | char_wb n-gram (3,5), max 40 000 фич | LinearSVC в CalibratedClassifierCV |
 
-```bash
-uv run scripts/submit.py
-```
+Используется дважды: для **TypeQuery** (бинарная классификация с порогом) и **ContentType** (6 классов).
 
-### Вручную через API
+### 2. RapidFuzz — поиск тайтла в словаре
 
-```bash
-curl -X POST \
-     -H "X-API-Key: YOUR_API_KEY" \
-     -F "file=@bundle.zip" \
-     https://app.ai-business-spb.ru/api/mediascope/submissions
-```
+Последовательный поиск по словарю KinoPoisk (~35 000 алиасов):
 
-## Формат submission-архива
+1. Точное совпадение после нормализации (ё→е, удаление шума, стоп-фраз, годов)
+2. `token_sort_ratio ≥ 72` — устойчив к перестановкам слов
+3. `token_set_ratio ≥ 78` — ловит вхождения (минимум 2 слова в алиасе)
+4. **Fallback:** longest group — разбивает запрос на группы по стоп-словам, берёт наибольшую; также извлекает текст из кавычек («...» / "...")
 
-Архив (`bundle.zip`) должен содержать:
+### 3. KinoPoisk override (без доп. запросов)
 
-- `solution.py` в корне с классом `PredictionModel` (см. выше)
-- Любые вспомогательные Python-модули и веса моделей рядом с `solution.py`
-- `data/`, `.venv/`, `.git/`, `notebooks/`, `scripts/` автоматически исключаются
+Корректировка ContentType на основе типа из словаря:
+- ML говорит `фильм/сериал`, KP говорит `мультфильм/мультсериал` → берём KP
+- ML говорит `null/NaN`, KP знает тип → берём KP
 
-Лимиты песочницы: 6 CPU, 48 GB RAM, 1 × NVIDIA RTX 4090 (24 GB VRAM), 10 мин, сетевой доступ только к разрешённым LLM API (Yandex Cloud, OpenAI, Anthropic).
+### 4. YandexGPT 5 Pro — LLM routing
 
-## Формат сдачи
+LLM вызывается в двух случаях:
 
-```
-Формат сдачи:
-– Презентации должны открываться по ссылке
-– Код загружен в публичный Git-репозиторий и открывается по ссылке (коммиты после дедлайна не принимаются)
-– В ReadMe — минимальная документация: структура кода, зависимости, инструкция по деплою
-– По кейсам с лидербордом — загружены и выбраны итоговые решения
-```
+| Условие | Что делает LLM |
+|---------|----------------|
+| Fuzzy не нашёл тайтл в словаре | Извлекает Title + ContentType |
+| ML уверенность (max proba) < 65% | Уточняет ContentType |
 
-## Активация промокода Яндекс
+Запросы объединяются в батчи по 15, обрабатываются в 5 параллельных потоков.
 
-```
-Активация промокода Яндекс:
-Для активации промокода необходимо:
+**Что умеет LLM:**
+- Транслитерация: `"garri potter"` → `"гарри поттер"`
+- Опечатки: `"антниме наруто"` → `"наруто"`, мультсериал
+- Реалити-шоу: `"взвешенные люди"` → прочее
+- Нормализация франшизы: `"мстители финал"` → `"мстители"`
+- Маппинг нестандартных типов: реалити-шоу / документальный / концерт → прочее; аниме → мультсериал
 
-1) Перейти по ссылке https://center.yandex.cloud/
-2) Перейти в раздел Billing
-3) Нажать кнопку Активировать промокод
-4) Активировать промокод
+---
 
-+ будет ссылка на инструкцию по активации биллинг аккаунта.
-```
+## Прогресс метрик
+
+| Версия | TypeQuery F2 | ContentType F1 | Title F1 | Итог |
+|--------|-------------|----------------|----------|------|
+| ML ансамбль только | 0.9645 | 0.5069 | 0.6208 | 0.7069 |
+| + LLM (yandexgpt-lite) для Title | 0.9645 | 0.5060 | 0.6434 | 0.7145 |
+| + YandexGPT 5 Pro + confidence routing | 0.9645 | 0.5172 | 0.6509 | **0.7206** |

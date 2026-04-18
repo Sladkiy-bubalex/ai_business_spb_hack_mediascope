@@ -3,6 +3,9 @@ __pycache__/
 *.pyo
 .venv/
 .env
+.idea/
+venv
+llm_config.json
 .ipynb_checkpoints/
 data/*
 !data/.gitkeep
