@@ -15,23 +15,28 @@ CASE = "mediascope"
 ROOT = Path(__file__).resolve().parent.parent
 BUNDLE = ROOT / "bundle.zip"
 
-EXCLUDE_DIRS = {"data", ".venv", ".git", "notebooks", "__pycache__", ".ipynb_checkpoints", "scripts"}
-EXCLUDE_FILES = {"bundle.zip", ".env", ".env.example", ".gitignore", ".python-version", "README.md", "pyproject.toml", "uv.lock"}
+INCLUDE = [
+    "solution.py",
+    "rules.py",
+    "yandex_llm.py",
+    "router.py",
+    "titles_dict.json",
+]
+INCLUDE_DIRS = ["models"]
 
 
 def build_bundle() -> Path:
     if BUNDLE.exists():
         BUNDLE.unlink()
     with zipfile.ZipFile(BUNDLE, "w", zipfile.ZIP_DEFLATED) as zf:
-        for path in ROOT.rglob("*"):
-            if not path.is_file():
-                continue
-            rel = path.relative_to(ROOT)
-            if any(part in EXCLUDE_DIRS for part in rel.parts):
-                continue
-            if rel.name in EXCLUDE_FILES:
-                continue
-            zf.write(path, rel.as_posix())
+        for name in INCLUDE:
+            path = ROOT / name
+            if path.exists():
+                zf.write(path, name)
+        for d in INCLUDE_DIRS:
+            for path in (ROOT / d).rglob("*"):
+                if path.is_file():
+                    zf.write(path, path.relative_to(ROOT).as_posix())
     print(f"built {BUNDLE} ({BUNDLE.stat().st_size} bytes)")
     return BUNDLE
 
