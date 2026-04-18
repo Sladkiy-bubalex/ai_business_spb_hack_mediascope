@@ -12,7 +12,18 @@ CONFIDENCE_THRESHOLD = 0.85
 MAX_WORKERS          = 5
 LLM_CHUNK            = 10
 
-_llm = YandexLLMClient()
+_llm: YandexLLMClient | None = None
+
+
+def _get_llm() -> YandexLLMClient | None:
+    global _llm
+    if _llm is None:
+        try:
+            _llm = YandexLLMClient()
+        except ValueError as e:
+            print(f"[Router] LLM unavailable: {e}")
+            return None
+    return _llm
 
 
 def needs_llm(confidence: float) -> bool:
@@ -31,9 +42,12 @@ def route(queries: list[str]) -> list[tuple[int, str, str, float]]:
     ]
     chunk_results: dict[int, list] = {}
 
+    llm = _get_llm()
+    if llm is None:
+        return [(0, "", "", 0.5)] * len(queries)
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {
-            executor.submit(_llm.classify, chunk): cidx
+            executor.submit(llm.classify, chunk): cidx
             for cidx, chunk in enumerate(chunks)
         }
         for future in as_completed(futures):

@@ -1,31 +1,76 @@
 import gc
 import json
 import os
-import pickle
 import re
-
+import sys
+import joblib
 import numpy as np
 import pandas as pd
-from rapidfuzz import fuzz, process
 
 try:
     from dotenv import load_dotenv
+    from rapidfuzz import fuzz, process
     load_dotenv()
+    HAS_RAPIDFUZZ = True
 except ImportError:
-    pass
+    HAS_RAPIDFUZZ = False
+    print("⚠️ rapidfuzz not installed. Fuzzy title matching will fall back to rule-based extraction.")
 
 from rules import apply_rules
 from router import needs_llm, route
 
+sys.modules['__main__'] = sys.modules[__name__]
+
+_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+class TextEnsemble:
+    """Ансамблевый классификатор — должен совпадать с классом при обучении."""
+    def __init__(self, n_models=3):
+        self.vecs = []
+        self.clfs = []
+        self.n_models = n_models
+
+    def fit(self, X_texts, y):
+        from sklearn.feature_extraction.text import TfidfVectorizer
+        from sklearn.linear_model import LogisticRegression, SGDClassifier
+        from sklearn.svm import LinearSVC
+        from sklearn.calibration import CalibratedClassifierCV
+
+        vec_configs = [
+            {'max_features': 50000, 'ngram_range': (1, 2), 'sublinear_tf': True, 'min_df': 2, 'max_df': 0.95, 'smooth_idf': True},
+            {'max_features': 30000, 'ngram_range': (2, 4), 'sublinear_tf': True, 'min_df': 2, 'max_df': 0.95, 'smooth_idf': True},
+            {'max_features': 40000, 'ngram_range': (3, 5), 'analyzer': 'char_wb', 'sublinear_tf': True, 'min_df': 2, 'max_df': 0.95, 'smooth_idf': True},
+        ]
+        clf_configs = [
+            LogisticRegression(C=1.5, max_iter=1500, class_weight='balanced', solver='lbfgs', n_jobs=-1),
+            SGDClassifier(loss='log_loss', max_iter=1500, class_weight='balanced', random_state=42, n_jobs=-1),
+            CalibratedClassifierCV(LinearSVC(C=1.0, class_weight='balanced', max_iter=3000, random_state=42), cv=3, method='isotonic'),
+        ]
+        for i in range(min(self.n_models, len(vec_configs), len(clf_configs))):
+            v = TfidfVectorizer(**vec_configs[i])
+            X_vec = v.fit_transform(X_texts)
+            clf = clf_configs[i]
+            clf.fit(X_vec, y)
+            self.vecs.append(v)
+            self.clfs.append(clf)
+        return self
+
+    def predict_proba(self, X_texts):
+        probs = np.zeros((len(X_texts), len(self.clfs[0].classes_)))
+        for v, c in zip(self.vecs, self.clfs):
+            probs += c.predict_proba(v.transform(X_texts))
+        return probs / len(self.clfs)
+
+    def predict(self, X_texts):
+        return np.argmax(self.predict_proba(X_texts), axis=1)
+
 CONFIDENCE_THRESHOLD = 0.85
-TYPE_THRESHOLD       = 0.35   # F2 штрафует FN вдвое — порог ниже 0.5
-SORT_THRESHOLD       = 72     # rapidfuzz token_sort_ratio (1-й проход, ловит перестановки)
-SET_THRESHOLD        = 78     # rapidfuzz token_set_ratio (2-й проход, ловит подмножества)
-MATCH_THRESHOLD      = 78     # общий порог принятия fuzzy-match
-DICT_CT_THRESHOLD    = 90     # порог переопределения ContentType из словаря
+SORT_THRESHOLD       = 72
+SET_THRESHOLD        = 78
+MATCH_THRESHOLD      = 78
 VALID_CT = {"фильм", "сериал", "мультфильм", "мультсериал"}
 
-# Generic-слова, которые не могут быть настоящим тайтлом (для fallback)
 _GENERIC_TITLE_WORDS = frozenset({
     "фильм", "фильмы", "фильма", "фильмов",
     "сериал", "сериалы", "сериала", "сериалов",
@@ -39,9 +84,6 @@ _GENERIC_TITLE_WORDS = frozenset({
     "сезон", "сезона", "сезоны", "серия", "серии", "серий",
 })
 
-_DIR = os.path.dirname(os.path.abspath(__file__))
-
-# Phrase-level очистка (убирает составные выражения до пословного _JUNK)
 _PHRASE_STOP = re.compile(
     r'смотреть\s+онлайн(?:\s+бесплатно)?(?:\s+в\s+хорошем\s+качестве)?'
     r'|скачать(?:\s+бесплатно)?(?:\s+торрент)?(?:\s+без\s+торрента)?'
@@ -68,16 +110,10 @@ _YEAR = re.compile(r'\b(19|20)\d{2}\b')
 _SPC  = re.compile(r'\s+')
 
 
-def _load(filename):
-    path = os.path.join(_DIR, "models", filename)
-    with open(path, "rb") as f:
-        return pickle.load(f)
-
-
 def _preprocess_for_title(text: str) -> str:
     t = text.lower().strip()
     t = re.sub(r'[«»""\'`]', '', t)
-    t = _PHRASE_STOP.sub('', t)   # phrase-level первым
+    t = _PHRASE_STOP.sub('', t)
     t = _YEAR.sub('', t)
     t = _JUNK.sub('', t)
     return _SPC.sub(' ', t).strip()
@@ -87,24 +123,24 @@ class PredictionModel:
     batch_size: int = 1024
 
     def __init__(self) -> None:
-        self.tfidf_type    = _load("tfidf_type.pkl")
-        self.model_type    = _load("model_type.pkl")
-        self.tfidf_content = _load("tfidf_content.pkl")
-        self.model_content = _load("model_content.pkl")
-        self.le_content    = _load("le_content.pkl")
-        self.stop_words    = _load("stop_words_search.pkl")
+        models_dir = os.path.join(_DIR, "models")
 
-        # Словарь тайтлов с нечётким поиском
+        # Ансамблевые ML-модели
+        self.ens_type, self.thresh = joblib.load(os.path.join(models_dir, "ens_type.pkl"))
+        self.ens_content           = joblib.load(os.path.join(models_dir, "ens_content.pkl"))
+        self.le_content            = joblib.load(os.path.join(models_dir, "le_content.pkl"))
+        self.noise                 = set(joblib.load(os.path.join(models_dir, "noise_words.pkl")))
+
+        # Словарь тайтлов
         self._lookup: dict[str, tuple[str, str, str, bool]] = {}
         self._aliases: list[str] = []
-        dict_path = os.path.join(_DIR, "models", "titles_dict.json")
+        dict_path = os.path.join(models_dir, "titles_dict.json")
         if os.path.exists(dict_path):
             with open(dict_path, encoding="utf-8") as f:
                 data = json.load(f)
             entries = data.get("titles", data) if isinstance(data, dict) else data
             for entry in entries:
                 if isinstance(entry, str):
-                    # старый формат: просто список строк
                     if entry not in self._lookup:
                         self._lookup[entry] = (entry, "", "", False)
                 else:
@@ -119,17 +155,15 @@ class PredictionModel:
             print(f"Словарь тайтлов: {len(self._aliases)} алиасов")
 
     # ------------------------------------------------------------------
+    # Вспомогательные методы
+    # ------------------------------------------------------------------
 
-    def _clean_text(self, text):
+    def _clean_text(self, text) -> str:
         if not isinstance(text, str):
             return ""
         text = text.lower()
         text = re.sub(r'[^a-zа-яё0-9\s]', ' ', text)
         return re.sub(r'\s+', ' ', text).strip()
-
-    def _match_title(self, query: str) -> tuple[str, str, float]:
-        title, ct, score, _ = self._match_title_full(query)
-        return title, ct, score
 
     def _match_title_full(self, query: str) -> tuple[str, str, float, bool]:
         """Двухуровневый fuzzy-поиск. Возвращает (title, content_type, score, kp_source)."""
@@ -140,40 +174,43 @@ class PredictionModel:
             canonical, ct, _, kp = self._lookup[clean]
             return canonical, ct, 100.0, kp
 
-        result = process.extractOne(
-            clean, self._aliases,
-            scorer=fuzz.token_sort_ratio,
-            score_cutoff=SORT_THRESHOLD,
-        )
-        if result is not None:
-            best_alias, score, _ = result
-            canonical, ct, _, kp = self._lookup[best_alias]
-            return canonical, ct, float(score), kp
+        if HAS_RAPIDFUZZ and self._aliases:
+            result = process.extractOne(
+                clean, self._aliases,
+                scorer=fuzz.token_sort_ratio,
+                score_cutoff=SORT_THRESHOLD,
+            )
+            if result is not None:
+                best_alias, score, _ = result
+                canonical, ct, _, kp = self._lookup[best_alias]
+                return canonical, ct, float(score), kp
 
-        result = process.extractOne(
-            clean, self._aliases,
-            scorer=fuzz.token_set_ratio,
-            score_cutoff=SET_THRESHOLD,
-        )
-        if result is None:
-            return "", "", 0.0, False
-        best_alias, score, _ = result
-        canonical, ct, _, kp = self._lookup[best_alias]
-        return canonical, ct, float(score), kp
+            result = process.extractOne(
+                clean, self._aliases,
+                scorer=fuzz.token_set_ratio,
+                score_cutoff=SET_THRESHOLD,
+            )
+            if result is not None:
+                best_alias, score, _ = result
+                canonical, ct, _, kp = self._lookup[best_alias]
+                return canonical, ct, float(score), kp
+
+        return "", "", 0.0, False
+
+    def _match_title(self, query: str) -> tuple[str, str, float]:
+        title, ct, score, _ = self._match_title_full(query)
+        return title, ct, score
 
     def _fallback_title(self, query: str):
-        """Стоп-слова + generic-фильтр. Возвращает nan если остались только мусорные слова."""
         if not isinstance(query, str) or pd.isna(query):
             return np.nan
-        words = query.split()
+        words = query.lower().split()
+        stop_set = self.noise | _GENERIC_TITLE_WORDS
         filtered = [
             w for w in words
-            if w not in self.stop_words
-            and w not in _GENERIC_TITLE_WORDS
-            and len(w) > 1
-            and not w.isdigit()
+            if w not in stop_set and len(w) > 1 and not w.isdigit()
         ]
-        title = " ".join(filtered[:5])  # >5 слов — скорее шум, чем реальный тайтл
+        title = " ".join(filtered[:5])
         return title if len(title) >= 2 else np.nan
 
     def _get_title_and_ct(self, queries_raw: list[str], queries_clean: list[str]) -> tuple[list, list]:
@@ -182,17 +219,13 @@ class PredictionModel:
         titles = [np.nan] * n
         cts    = [np.nan] * n
 
-        # ContentType — ML (базовое предсказание)
-        X_ct      = self.tfidf_content.transform(pd.Series(queries_clean))
-        ct_enc    = self.model_content.predict(X_ct)
-        ct_labels = self.le_content.inverse_transform(ct_enc)
+        # ContentType через ансамблевую модель
+        pred_codes = self.ens_content.predict(pd.Series(queries_clean))
+        ct_labels  = self.le_content.inverse_transform(pred_codes)
         for k in range(n):
             cts[k] = ct_labels[k]
 
-        # Title — словарь с fuzzy, иначе стоп-слова.
-        # CT override:
-        #   - train.csv записи (kp_source=False): CT точный — всегда перекрываем ML
-        #   - KP записи (kp_source=True): CT только фильм/сериал — доверяем только для animated
+        # Title: словарь + fuzzy, потом fallback; CT override из словаря
         ANIMATED = {"мультфильм", "мультсериал"}
         for k, (raw, _) in enumerate(zip(queries_raw, queries_clean)):
             if self._aliases:
@@ -201,14 +234,16 @@ class PredictionModel:
                     titles[k] = title
                     if dict_ct in VALID_CT:
                         if not kp_src:
-                            cts[k] = dict_ct  # train.csv — точный CT
+                            cts[k] = dict_ct
                         elif dict_ct in ANIMATED:
-                            cts[k] = dict_ct  # KP — только для animated
+                            cts[k] = dict_ct
                     continue
             titles[k] = self._fallback_title(self._clean_text(raw))
 
         return titles, cts
 
+    # ------------------------------------------------------------------
+    # Основной predict
     # ------------------------------------------------------------------
 
     def predict(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -218,7 +253,7 @@ class PredictionModel:
         type_out  = [0]      * n
         ct_out    = [np.nan] * n
         title_out = [np.nan] * n
-        llm_done: set[int] = set()   # запросы, обработанные LLM (их ответ не переписываем)
+        llm_done: set[int] = set()
 
         # ------------------------------------------------------------------
         # Шаг 1: Rule-based фильтр
@@ -235,40 +270,38 @@ class PredictionModel:
         # ------------------------------------------------------------------
         # Шаг 1.5: Словарь-бустер TypeQuery
         # Для rules-неуверенных запросов — fuzzy match по словарю.
-        # Если найден известный тайтл → TypeQuery=1, используем ct+title из словаря.
+        # Если найден известный тайтл → TypeQuery=1, title из словаря.
         # ------------------------------------------------------------------
-        # Для таких запросов принудительно ставим TypeQuery=1 и title из словаря.
-        # ContentType НЕ заполняем из словаря — оставляем на ML в шаге 4.
         need_ml_final = []
-        dict_boosted = []
         if self._aliases:
             for i in need_ml:
                 title, _, score = self._match_title(queries[i])
                 if score >= MATCH_THRESHOLD:
                     type_out[i]  = 1
                     title_out[i] = title
-                    dict_boosted.append(i)
                 else:
                     need_ml_final.append(i)
         else:
             need_ml_final = need_ml
 
         # ------------------------------------------------------------------
-        # Шаг 2: ML — порог 0.35 (F2 favours recall)
+        # Шаг 2: ML-ансамбль
         # ------------------------------------------------------------------
         need_llm_idx = []
-        ml_fallback  = {}
+        ml_fallback: dict[int, tuple] = {}
 
         if need_ml_final:
             ml_raw     = [queries[i] for i in need_ml_final]
             ml_cleaned = [self._clean_text(q) for q in ml_raw]
             cleaned_s  = pd.Series(ml_cleaned)
 
-            X_type     = self.tfidf_type.transform(cleaned_s)
-            proba_type = self.model_type.predict_proba(X_type)[:, 1]  # P(tq=1)
-            preds      = (proba_type >= TYPE_THRESHOLD).astype(int)
+            probs_type = self.ens_type.predict_proba(cleaned_s)
+            proba_type = probs_type[:, 1]  # P(TypeQuery=1)
+            preds      = (proba_type >= self.thresh).astype(int)
 
-            high_conf_pos, low_conf = [], []
+            high_conf_pos = []
+            low_conf_j    = []
+
             for j, (tq, p1) in enumerate(zip(preds, proba_type)):
                 i    = need_ml_final[j]
                 conf = float(p1) if tq == 1 else float(1 - p1)
@@ -276,13 +309,13 @@ class PredictionModel:
                 if needs_llm(conf):
                     need_llm_idx.append(i)
                     ml_fallback[i] = (int(tq), j)
-                    low_conf.append(j)
+                    low_conf_j.append(j)
                 else:
                     type_out[i] = int(tq)
                     if tq == 1:
                         high_conf_pos.append((i, j))
 
-            # CT + Title для высокоуверенных tq=1
+            # CT + Title для высокоуверенных TypeQuery=1
             if high_conf_pos:
                 hc_raw     = [ml_raw[j]     for _, j in high_conf_pos]
                 hc_cleaned = [ml_cleaned[j] for _, j in high_conf_pos]
@@ -291,17 +324,21 @@ class PredictionModel:
                     ct_out[i]    = cts[k]
                     title_out[i] = titles[k]
 
-            # CT + Title для LLM-bound запросов (ML fallback на случай отказа LLM)
-            lc_tq1 = [(need_ml_final[lj], lj) for lj in low_conf
-                      if ml_fallback[need_ml_final[lj]][0] == 1]
+            # ML-fallback для LLM-bound запросов (на случай отказа LLM)
+            lc_tq1 = [
+                (need_ml_final[lj], lj) for lj in low_conf_j
+                if ml_fallback[need_ml_final[lj]][0] == 1
+            ]
             if lc_tq1:
                 lc_raw     = [ml_raw[j]     for _, j in lc_tq1]
                 lc_cleaned = [ml_cleaned[j] for _, j in lc_tq1]
                 titles, cts = self._get_title_and_ct(lc_raw, lc_cleaned)
                 for k, (i, _) in enumerate(lc_tq1):
                     ml_fallback[i] = (1, cts[k], titles[k])
+
+            # Нормализуем fallback для TypeQuery=0 случаев
             for i in need_llm_idx:
-                if isinstance(ml_fallback[i][1], int):
+                if len(ml_fallback[i]) == 2:
                     tq_fb = ml_fallback[i][0]
                     ml_fallback[i] = (tq_fb, np.nan, np.nan)
 
@@ -312,7 +349,7 @@ class PredictionModel:
             llm_queries = [queries[i] for i in need_llm_idx]
             llm_results = route(llm_queries)
             for i, (tq, ct, title, conf) in zip(need_llm_idx, llm_results):
-                if conf <= 0.5:  # LLM упал — ML fallback
+                if conf <= 0.5:  # LLM недоступен → ML fallback
                     tq_ml, ct_ml, title_ml = ml_fallback[i]
                     type_out[i]  = tq_ml
                     ct_out[i]    = ct_ml    if not (isinstance(ct_ml,    float) and np.isnan(ct_ml))    else np.nan
@@ -321,10 +358,11 @@ class PredictionModel:
                     type_out[i]  = tq
                     ct_out[i]    = ct    if ct    else np.nan
                     title_out[i] = title if title else np.nan
-                    llm_done.add(i)  # LLM дал ответ — уважаем его, не перезаписываем в step 4
+                    llm_done.add(i)
 
         # ------------------------------------------------------------------
-        # Шаг 4: Дозаполнение CT+Title для tq=1 без предсказания (НЕ трогаем LLM-результаты)
+        # Шаг 4: Дозаполнение CT+Title для TypeQuery=1 без предсказания
+        # (LLM-результаты не трогаем)
         # ------------------------------------------------------------------
         missing = [
             i for i, tq in enumerate(type_out)
@@ -343,7 +381,6 @@ class PredictionModel:
                 if isinstance(title_out[i], float) and np.isnan(title_out[i]):
                     title_out[i] = titles[k]
 
-        # ------------------------------------------------------------------
         gc.collect()
 
         out = df[["QueryText"]].copy()
@@ -369,25 +406,25 @@ def _get_model() -> PredictionModel:
 
 def _ml_predict(queries: list[str]) -> list[tuple[int, str, float]]:
     """Возвращает [(TypeQuery, ContentType, confidence), ...] для каждого запроса."""
-    model   = _get_model()
-    cleaned = [model._clean_text(q) for q in queries]
-    X_type  = model.tfidf_type.transform(pd.Series(cleaned))
-    proba   = model.model_type.predict_proba(X_type)[:, 1]
-    preds   = (proba >= TYPE_THRESHOLD).astype(int)
+    model    = _get_model()
+    cleaned  = pd.Series([model._clean_text(q) for q in queries])
+    probs    = model.ens_type.predict_proba(cleaned)
+    proba_1  = probs[:, 1]
+    preds    = (proba_1 >= model.thresh).astype(int)
 
     results = []
-    for j, (tq, p1) in enumerate(zip(preds, proba)):
+    for j, (tq, p1) in enumerate(zip(preds, proba_1)):
         conf = float(p1) if tq == 1 else float(1 - p1)
         ct   = ""
         if tq == 1:
-            X_ct  = model.tfidf_content.transform(pd.Series([cleaned[j]]))
-            ct    = model.le_content.inverse_transform(model.model_content.predict(X_ct))[0]
+            pred_code = model.ens_content.predict(pd.Series([cleaned.iloc[j]]))
+            ct        = model.le_content.inverse_transform(pred_code)[0]
         results.append((int(tq), ct, conf))
     return results
 
 
 def _get_title(query: str) -> str:
-    """Извлекает тайтл из запроса: сначала словарь, потом fallback по стоп-словам."""
+    """Извлекает тайтл из запроса: сначала словарь, потом fallback."""
     model = _get_model()
     if model._aliases:
         title, _, score = model._match_title(query)
